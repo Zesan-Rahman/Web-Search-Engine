@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 from urllib.robotparser import RobotFileParser
 from html.parser import HTMLParser
-from typing import Tuple, List
+from typing import List
 
 import tldextract
 from ddgs import DDGS
@@ -18,6 +18,7 @@ from ddgs import DDGS
 PRIO = 0
 LINK = 1
 DEPTH = 2
+MAX_CRAWL = 5100
 
 BLACKLIST_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.pdf', '.zip',
                          '.mp3', '.mp4', '.css', '.js', '.svg', '.ico')
@@ -25,8 +26,7 @@ BLACKLIST_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.pdf', '.zip',
 INDEX_NAMES = ('index.htm', 'index.html', 'index.jsp', 'index.php',
                'main.html', 'default.htm', 'default.html')
 
-# Shared state + locks
-
+# Dictionaries + locks
 domain_counts = {}
 superdomain_counts = {}
 domains_lock = threading.Lock()
@@ -37,10 +37,13 @@ visited_lock = threading.Lock()
 robot_domains = {}
 robots_lock = threading.Lock()
 
+log_lock = threading.Lock()
+stats_lock = threading.Lock()
 filecount_lock = threading.Lock()
-
-pages_crawled = [0]
-pages_crawled_lock = threading.Lock()
+response_code_counts = {}      
+total_size = [0]
+total_crawled = [0]
+crawl_done = threading.Event()
 
 # HTML link extraction
 class LinkExtractor(HTMLParser):
@@ -59,15 +62,39 @@ class LinkExtractor(HTMLParser):
                 if name == "href" and value:
                     self.base_href = value
 
+class Logger:
+    def __init__(self, filename: str):
+        self.file = open(filename, 'a', buffering=1, encoding='utf-8')
+        self.lock = threading.Lock()
 
-# URL normalization
+    def write(self, message: str) -> None:
+        with self.lock:
+            try:
+                self.file.write(message + "\n")
+            except OSError as e:
+                print(f"Failed to write to log file: {e}")
 
+    def close(self) -> None:
+        with self.lock:
+            self.file.close()
+
+def log_page(logger: Logger, url: str, code: int, size: int, depth: int) -> None:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    logger.write(f"{timestamp}\t{code}\t{size}\t{depth}\t{url}")
+    with stats_lock:
+        response_code_counts[code] = response_code_counts.get(code, 0) + 1
+        total_size[0] += size
+        total_crawled[0] += 1
+        if total_crawled[0] >= MAX_CRAWL:
+            crawl_done.set()
+
+#www counts as a new url (www.example.com and example.com are distinct)
 def normalize_url(url: str) -> str:
     parts = urlsplit(url)
 
     scheme = parts.scheme.lower()
 
-    netloc = parts.netloc.lower()  # www. is intentionally left as-is (treated as distinct)
+    netloc = parts.netloc.lower()
     if scheme == 'http' and netloc.endswith(':80'):
         netloc = netloc[:-3]
     elif scheme == 'https' and netloc.endswith(':443'):
@@ -135,10 +162,11 @@ def get_robot_parser(url: str) -> RobotFileParser | None:
     return rp
 
 # Queueing links
-def push_links(q: "queue.PriorityQueue", links: List[str], depth: int) -> None:
+def push_links(q: queue.PriorityQueue, links: List[str], depth: int) -> None:
     for link in links:
+        if "cgi" in link.lower():
+            continue
         link = normalize_url(link)
-
         with visited_lock:
             if link in visited_links:
                 continue
@@ -150,16 +178,18 @@ def push_links(q: "queue.PriorityQueue", links: List[str], depth: int) -> None:
         item = (-1 * calculatePrio(link), link, depth)
         q.put(item)
 
-def download_page(response, fileCount: int) -> str | None:
-    html = response.read().decode("utf-8", errors='replace')
-    fileName = "content/" + str(response.status) + "-" + str(fileCount) + ".parsed"
+def download_page(response, fileCount: int) -> tuple[str, int] | None:
+    raw_bytes = response.read()
+    size = len(raw_bytes)
+    html = raw_bytes.decode("utf-8", errors='replace')
+    fileName = "content/" + str(response.status) + "-" + str(fileCount)
     try:
         with open(fileName, 'x', encoding='utf-8') as f:
             f.write(html)
     except OSError as e:
         print(f"Failed to write {fileName}: {e}")
         return None
-    return html
+    return html, size
 
 def links_from_page(base_url: str, html: str) -> List[str]:
     parser = LinkExtractor()
@@ -179,19 +209,20 @@ def links_from_page(base_url: str, html: str) -> List[str]:
     return resolved_links
 
 # Fetching + parsing a single page
-def parse_url(fileCount, url: str, depth: int, q: "queue.PriorityQueue") -> None:
+def parse_url(fileCount, url: str, depth: int, q: queue.PriorityQueue, logger: Logger) -> None:
     try:
-        response = request.urlopen(url)
+        response = request.urlopen(url, timeout=10)
     except HTTPError as e:
         print('The server couldn\'t fulfill the request.')
         print('Error code: ', e.code)
+        log_page(logger, url, e.code, 0, depth)
         return
     except URLError as e:
         print('We failed to reach a server.')
         print('Reason: ', e.reason)
         return
 
-    base_url = normalize_url(response.url)  # final URL after any redirects
+    base_url = normalize_url(response.url)
     with visited_lock:
         if base_url in visited_links:
             return
@@ -199,60 +230,71 @@ def parse_url(fileCount, url: str, depth: int, q: "queue.PriorityQueue") -> None
 
     content_type = response.headers.get_content_type()
     if content_type != "text/html":
-        print(f"Skipping non-HTML content ({content_type}) at {url}")
+        # print(f"Skipping non-HTML content ({content_type}) at {url}")
+        log_page(logger, base_url, response.status, 0, depth)
         return
 
     with filecount_lock:
         current_filecount = next(fileCount)
 
-    html = download_page(response, current_filecount)
-    if not html:
+    result = download_page(response, current_filecount)
+    if not result:
         return
+    html, size = result
 
-    with pages_crawled_lock:
-        pages_crawled[0] += 1
+    log_page(logger, base_url, response.status, size, depth)
 
     new_links = links_from_page(base_url, html)
     push_links(q, new_links, depth + 1)
 
-# Setup (search query -> seed links)
-def setup(q: "queue.PriorityQueue") -> None:
+# Setup: Search query, pushes first 10 links, creates content directory and log files
+def setup(q: queue.PriorityQueue) -> Logger:
     if "content" not in os.listdir("."):
         os.mkdir("content")
 
     print("Enter search query:")
     user_query = input()
-    print(f"Searching {user_query} using google.com")
+    user_query = "".join(c if c.isalnum() else "-" for c in user_query)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_file_name = user_query + "_" + timestamp + "_results.txt"
+    logger = Logger(log_file_name)
+    logger.write(f"Searching {user_query} using google.com")
+    logger.write("Format: timestamp code size depth url")
+
     results = DDGS().text(user_query, region='us-en', safesearch='on')
     links = [result['href'] for result in results]
-    print(f"First 10 links: {links}")
+    # print(f"First 10 links: {links}")
+
     push_links(q, links, 0)
+    return logger
 
 # Worker + monitor threads
-def worker(q: "queue.PriorityQueue", fileCount) -> None:
-    while True:
+def worker(q, fileCount, logger: Logger) -> None:
+    while not crawl_done.is_set():
         try:
             url_info = q.get(timeout=5)
         except queue.Empty:
             return
         url = url_info[LINK]
         depth = url_info[DEPTH]
-        print(f"parsing {url}")
-        parse_url(fileCount, url, depth, q)
-
+        # print(f"parsing {url}")
+        parse_url(fileCount, url, depth, q, logger)
+    return
 
 def monitor(start_time: float, stop_event: threading.Event, interval: float = 5) -> None:
+    count = 0
     while not stop_event.wait(interval):
         elapsed = time.time() - start_time
-        with pages_crawled_lock:
-            count = pages_crawled[0]
-        rate = count / elapsed if elapsed > 0 else 0
-        print(f"[{elapsed:.0f}s] {count} pages crawled ({rate:.2f}/sec)")
+        new_count = len(os.listdir("./content/"))
+        rate = new_count - count / elapsed if elapsed > 0 else 0
+        count = new_count
+        # print(f"[{elapsed:.0f}s] {count} total pages crawled ({rate:.2f}/sec) in the last 10 seconds")
 
 # Main
-def crawler(num_threads: int = 15) -> None:
+def crawler(num_threads: int = 15, log_file_name: str = "log") -> None:
     q = queue.PriorityQueue()
-    setup(q)
+    logger = setup(q)
     fileCount = itertools.count(0)
     start_time = time.time()
 
@@ -260,7 +302,7 @@ def crawler(num_threads: int = 15) -> None:
     mon = threading.Thread(target=monitor, args=(start_time, stop_event))
     mon.start()
 
-    threads = [threading.Thread(target=worker, args=(q, fileCount)) for _ in range(num_threads)]
+    threads = [threading.Thread(target=worker, args=(q, fileCount, logger)) for _ in range(num_threads)]
     for t in threads:
         t.start()
     for t in threads:
@@ -270,8 +312,15 @@ def crawler(num_threads: int = 15) -> None:
     mon.join()
 
     elapsed = time.time() - start_time
-    print(f"Crawled {pages_crawled[0]} pages in {elapsed:.2f}s ({pages_crawled[0]/elapsed:.2f} pages/sec)")
+    logger.write("")
+    logger.write(f"Pages crawled: {total_crawled[0]}")
+    logger.write(f"Total size: {total_size[0]} bytes")
+    logger.write(f"Total time: {elapsed:.2f}s")
+    for code, cnt in sorted(response_code_counts.items()):
+        logger.write(f"Code {code}: {cnt}")
 
+    logger.close()
+    # print(f"Crawled {total_crawled} pages in {elapsed:.2f}s ({total_crawled/elapsed:.2f} pages/sec)")
 
 if __name__ == "__main__":
     crawler()
