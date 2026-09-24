@@ -10,9 +10,9 @@ from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, parse_qsl, url
 from urllib.robotparser import RobotFileParser
 from html.parser import HTMLParser
 from typing import List
-
 import tldextract
 from ddgs import DDGS
+import socket
 
 # Constants
 PRIO = 0
@@ -25,6 +25,8 @@ BLACKLIST_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.pdf', '.zip',
 
 INDEX_NAMES = ('index.htm', 'index.html', 'index.jsp', 'index.php',
                'main.html', 'default.htm', 'default.html')
+
+socket.setdefaulttimeout(5)
 
 # Dictionaries + locks
 domain_counts = {}
@@ -171,10 +173,6 @@ def push_links(q: queue.PriorityQueue, links: List[str], depth: int) -> None:
             if link in visited_links:
                 continue
 
-        rp = get_robot_parser(link)
-        if rp is not None and not rp.can_fetch("*", link):
-            continue
-
         item = (-1 * calculatePrio(link), link, depth)
         q.put(item)
 
@@ -210,16 +208,23 @@ def links_from_page(base_url: str, html: str) -> List[str]:
 
 # Fetching + parsing a single page
 def parse_url(fileCount, url: str, depth: int, q: queue.PriorityQueue, logger: Logger) -> None:
+    rp = get_robot_parser(url)
+    if rp is not None and not rp.can_fetch("*", url):
+        log_page(logger, url, 404, 0, depth)
+        return
+
     try:
-        response = request.urlopen(url, timeout=10)
+        response = request.urlopen(url, timeout=5)
     except HTTPError as e:
-        print('The server couldn\'t fulfill the request.')
-        print('Error code: ', e.code)
         log_page(logger, url, e.code, 0, depth)
         return
     except URLError as e:
-        print('We failed to reach a server.')
-        print('Reason: ', e.reason)
+        logger.write(f"Failed to reach server for {url}")
+        return
+        #Catch low level exceptions killing my threads
+    except Exception as e:
+        logger.write(f"Low-level connection error on {url}: {e}")
+        print(f"Low-level connection error on {url}: {e}")
         return
 
     base_url = normalize_url(response.url)
@@ -248,13 +253,20 @@ def parse_url(fileCount, url: str, depth: int, q: queue.PriorityQueue, logger: L
     push_links(q, new_links, depth + 1)
 
 # Setup: Search query, pushes first 10 links, creates content directory and log files
-def setup(q: queue.PriorityQueue) -> Logger:
-    if "content" not in os.listdir("."):
-        os.mkdir("content")
+def setup(q: queue.PriorityQueue) -> Logger | None:
 
     print("Enter search query:")
     user_query = input()
     user_query = "".join(c if c.isalnum() else "-" for c in user_query)
+    
+    dir = "content/" + user_query
+    if "content" not in os.listdir("."):
+        os.mkdir("content")
+    if dir not in os.listdir("./content"):
+        os.mkdir(dir)
+    else:
+        print("You have crawled off this query before and should remove its corresponding directory in content/")
+        return
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_file_name = user_query + "_" + timestamp + "_results.txt"
@@ -279,7 +291,10 @@ def worker(q, fileCount, logger: Logger) -> None:
         url = url_info[LINK]
         depth = url_info[DEPTH]
         # print(f"parsing {url}")
-        parse_url(fileCount, url, depth, q, logger)
+        try:
+            parse_url(fileCount, url, depth, q, logger)
+        except Exception as e:
+            logger.write(f"Unknown error with {url}")
     return
 
 def monitor(start_time: float, stop_event: threading.Event, interval: float = 5) -> None:
@@ -287,14 +302,17 @@ def monitor(start_time: float, stop_event: threading.Event, interval: float = 5)
     while not stop_event.wait(interval):
         elapsed = time.time() - start_time
         new_count = len(os.listdir("./content/"))
-        rate = new_count - count / elapsed if elapsed > 0 else 0
+        rate = (new_count - count) / elapsed if elapsed > 0 else 0
         count = new_count
-        # print(f"[{elapsed:.0f}s] {count} total pages crawled ({rate:.2f}/sec) in the last 10 seconds")
+        print(f"[{elapsed:.0f}s] {count} total pages crawled ({rate:.2f}/sec) in the last 10 seconds")
 
 # Main
 def crawler(num_threads: int = 15, log_file_name: str = "log") -> None:
     q = queue.PriorityQueue()
     logger = setup(q)
+    if logger is None:
+        return
+
     fileCount = itertools.count(0)
     start_time = time.time()
 
